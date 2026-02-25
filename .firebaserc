@@ -1,0 +1,8 @@
+{
+  "projects": {
+    "default": "quickboooksint",
+    "prod": "mbs-app-3ffa0"
+  },
+  "targets": {},
+  "etags": {}
+}
