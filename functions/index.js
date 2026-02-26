@@ -11,6 +11,20 @@ const Busboy = require('busboy');
 const { getStorage } = require('firebase-admin/storage');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+const {
+    utcNowISO,
+    tsId,
+    trimObject,
+    pickErrorDetails,
+    cleanUndefined,
+    safeIdPart,
+    parseBool,
+    parseIntSafe,
+    parseISODate,
+    tryParseJSON,
+} = require('./utils');
+const { createSecretManager } = require('./secretManager');
+const { createTenantConfig } = require('./tenantConfig');
 
 initializeApp();
 
@@ -37,6 +51,11 @@ const qbDb = getFirestore("cdptest");
 const secretClient = new SecretManagerServiceClient();
 const PROJECT_ID = process.env.GCP_PROJECT || process.env.GCLOUD_PROJECT;
 const bucket = getStorage().bucket('mbs-app-3ffa0.firebasestorage.app');
+
+const { storeSecret, getSecret } = createSecretManager({ secretClient, PROJECT_ID, logger });
+const { getTenantConfig, updateTenantRefreshToken } = createTenantConfig({
+    qbDb, secretClient, storeSecret, getSecret, utcNowISO, PROJECT_ID, logger,
+});
 
 const http = axios.create({
     timeout: 30000,
@@ -108,87 +127,11 @@ const STORAGE_CONFIG = {
 };
 
 // ========================================================================================
-// UTILITY FUNCTIONS
+// UTILITY FUNCTIONS (imported from utils.js)
 // ========================================================================================
-
-function utcNowISO() {
-    return new Date().toISOString();
-    //2026-02-10T05:30:00.123Z
-}
-
-function tsId() {
-    return new Date().toISOString().replace(/[:.]/g, "-");
-    //2026-02-10T14-55-30-456Z
-}
-
-//Check how much json is getting trimmed
-function trimObject(obj, maxLen = 6000) {
-    if (!obj) return null;
-    try {
-        const s = JSON.stringify(obj);
-        if (s.length <= maxLen) return obj;
-        return { _trimmed: true, preview: s.slice(0, maxLen) };
-    } catch {
-        return { _unserializable: true };
-    }
-}
-
-function pickErrorDetails(err) {
-    return {
-        message: err?.message || String(err),
-        code: err?.code || null,
-        status: err?.response?.status || err?.statusCode || null,
-        details: trimObject(err?.response?.data || null),
-    };
-}
-
-function cleanUndefined(input) {
-    if (input === undefined || input === null) return null;
-    if (Array.isArray(input)) {
-        return input.map((v) => cleanUndefined(v)).filter((v) => v !== undefined && v !== null);
-    }
-    if (typeof input === "object") {
-        const out = {};
-        for (const [k, v] of Object.entries(input)) {
-            if (v === undefined) continue;
-            const cleaned = cleanUndefined(v);
-            if (cleaned !== undefined && cleaned !== null) out[k] = cleaned;
-        }
-        return out;
-    }
-    return input;
-}
-
-function safeIdPart(v, maxLen = 80) {
-    const s = String(v ?? "").trim();
-    if (!s) return "NA";
-    return s
-        .replace(/\s+/g, "_")
-        .replace(/[^a-zA-Z0-9_-]/g, "_")
-        .replace(/_+/g, "_")
-        .replace(/^_+|_+$/g, "")
-        .slice(0, maxLen) || "NA";
-}
-
-function parseBool(v) {
-    if (v === undefined || v === null || v === "") return null;
-    const s = String(v).toLowerCase().trim();
-    if (s === "true" || s === "1" || s === "yes") return true;
-    if (s === "false" || s === "0" || s === "no") return false;
-    return null;
-}
-
-function parseIntSafe(v, def) {
-    const n = parseInt(String(v), 10);
-    return Number.isFinite(n) ? n : def;
-}
-
-function parseISODate(v) {
-    if (!v) return null;
-    const d = new Date(String(v));
-    if (Number.isNaN(d.getTime())) return null;
-    return d.toISOString();
-}
+// utcNowISO, tsId, trimObject, pickErrorDetails, cleanUndefined,
+// safeIdPart, parseBool, parseIntSafe, parseISODate, tryParseJSON
+// — all imported at the top of this file from './utils'
 
 async function getTotalCountSafe(query) {
     try {
@@ -213,186 +156,15 @@ async function readDocSafe(ref) {
     }
 }
 
-function tryParseJSON(str) {
-    if (typeof str !== 'string') return str;
-
-    const trimmed = str.trim();
-
-    if (
-        (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
-        (trimmed.startsWith('[') && trimmed.endsWith(']'))
-    ) {
-        try {
-            return JSON.parse(trimmed);
-        } catch (e) {
-            return str;
-        }
-    }
-
-    if (trimmed === 'true') return true;
-    if (trimmed === 'false') return false;
-    if (trimmed === 'null') return null;
-
-    if (!isNaN(trimmed) && trimmed !== '') {
-        const num = Number(trimmed);
-        if (Number.isFinite(num)) return num;
-    }
-
-    return str;
-}
+// ========================================================================================
+// SECRET MANAGER OPERATIONS (imported from secretManager.js)
+// ========================================================================================
+// storeSecret, getSecret — wired above via createSecretManager()
 
 // ========================================================================================
-// SECRET MANAGER OPERATIONS
+// TENANT CONFIGURATION (imported from tenantConfig.js)
 // ========================================================================================
-
-async function storeSecret(tenantId, secretType, secretValue) {
-    const secretId = `qb-${tenantId}-${secretType}`;
-    const parent = `projects/${PROJECT_ID}`;
-    const secretPath = `${parent}/secrets/${secretId}`;
-
-    try {
-        let secretExists = false;
-        try {
-            await secretClient.getSecret({ name: secretPath });
-            secretExists = true;
-        } catch (error) {
-            if (error.code !== 5) throw error;
-        }
-
-        if (secretExists) {
-            try {
-                const [currentVersion] = await secretClient.accessSecretVersion({
-                    name: `${secretPath}/versions/latest`,
-                });
-                const currentValue = currentVersion.payload.data.toString('utf8');
-
-                if (currentValue === secretValue) {
-                    logger.info(`⏭️  Secret unchanged, skipping: ${secretId}`);
-                    return;
-                }
-
-                await secretClient.addSecretVersion({
-                    parent: secretPath,
-                    payload: { data: Buffer.from(secretValue, 'utf8') },
-                });
-
-                await secretClient.disableSecretVersion({ name: currentVersion.name });
-                logger.info(`✅ Updated secret (value changed): ${secretId}`);
-            } catch (accessError) {
-                logger.warn(`Could not compare secret values for ${secretId}, updating anyway`);
-                await secretClient.addSecretVersion({
-                    parent: secretPath,
-                    payload: { data: Buffer.from(secretValue, 'utf8') },
-                });
-            }
-        } else {
-            const [secret] = await secretClient.createSecret({
-                parent,
-                secretId,
-                secret: { replication: { automatic: {} } },
-            });
-            await secretClient.addSecretVersion({
-                parent: secret.name,
-                payload: { data: Buffer.from(secretValue, 'utf8') },
-            });
-            logger.info(`✅ Created secret: ${secretId}`);
-        }
-    } catch (error) {
-        logger.error(`Failed to store secret ${secretId}:`, error.message);
-        throw new Error(`Failed to store secret: ${error.message}`);
-    }
-}
-
-async function getSecret(tenantId, secretType) {
-    const secretId = `qb-${tenantId}-${secretType}`;
-    const name = `projects/${PROJECT_ID}/secrets/${secretId}/versions/latest`;
-
-    try {
-        const [version] = await secretClient.accessSecretVersion({ name });
-        return version.payload.data.toString('utf8');
-    } catch (error) {
-        if (error.code === 5) {
-            throw new Error(`Secret not found: ${secretId}. Please register the tenant first.`);
-        }
-        logger.error(`Failed to retrieve secret ${secretId}:`, error.message);
-        throw new Error(`Failed to retrieve secret: ${error.message}`);
-    }
-}
-
-// ========================================================================================
-// TENANT CONFIGURATION
-// ========================================================================================
-
-async function getTenantConfig(tenantId) {
-    if (!tenantId) throw new Error("tenantId is required");
-
-    const tenantRef = qbDb.collection("qb_tenants").doc(tenantId);
-    const tenantDoc = await tenantRef.get();
-
-    if (!tenantDoc.exists) {
-        throw new Error(`Tenant ${tenantId} not found. Please register this QuickBooks company first.`);
-    }
-
-    const data = tenantDoc.data();
-    if (data.isActive === false) {
-        throw new Error(`Tenant ${tenantId} is inactive`);
-    }
-
-    const [clientId, clientSecret, refreshToken, webhookVerifier] = await Promise.all([
-        getSecret(tenantId, 'clientId'),
-        getSecret(tenantId, 'clientSecret'),
-        getSecret(tenantId, 'refreshToken'),
-        getSecret(tenantId, 'webhookVerifier'),
-    ]);
-
-    return {
-        clientId,
-        clientSecret,
-        refreshToken,
-        realmId: data.realmId,
-        webhookVerifier,
-        baseUrl: data.baseUrl || "https://quickbooks.api.intuit.com/v3/company",
-        minorVersion: data.minorVersion || "65",
-        environment: data.environment || "production",
-        isActive: data.isActive !== false,
-        metadata: data.metadata || {},
-    };
-}
-
-async function updateTenantRefreshToken(tenantId, newRefreshToken) {
-    const secretId = `qb-${tenantId}-refreshToken`;
-    const secretPath = `projects/${PROJECT_ID}/secrets/${secretId}`;
-
-    try {
-        const [currentVersion] = await secretClient.accessSecretVersion({
-            name: `${secretPath}/versions/latest`,
-        });
-        const currentValue = currentVersion.payload.data.toString('utf8');
-
-        if (currentValue === newRefreshToken) {
-            logger.info(`⏭️  [${tenantId}] Refresh token unchanged, skipping update`);
-            return;
-        }
-
-        await storeSecret(tenantId, 'refreshToken', newRefreshToken);
-        await qbDb.collection("qb_tenants").doc(tenantId).update({
-            lastTokenRefresh: utcNowISO(),
-            updatedAt: utcNowISO(),
-        });
-
-        logger.info(`🔄 [${tenantId}] Refresh token rotated successfully`);
-    } catch (error) {
-        if (error.code === 5) {
-            await storeSecret(tenantId, 'refreshToken', newRefreshToken);
-            await qbDb.collection("qb_tenants").doc(tenantId).update({
-                lastTokenRefresh: utcNowISO(),
-                updatedAt: utcNowISO(),
-            });
-        } else {
-            throw error;
-        }
-    }
-}
+// getTenantConfig, updateTenantRefreshToken — wired above via createTenantConfig()
 
 // ========================================================================================
 // LOGGING SYSTEM (PER-ENTITY + ERROR INDEX)
