@@ -82,6 +82,7 @@ function createTenantConfig({ qbDb, secretClient, storeSecret, getSecret, utcNow
                     lastTokenRefresh: utcNowISO(),
                     updatedAt: utcNowISO(),
                 });
+                logger.info(`🔄 [${tenantId}] Refresh token rotated successfully`);
             } else {
                 throw error;
             }

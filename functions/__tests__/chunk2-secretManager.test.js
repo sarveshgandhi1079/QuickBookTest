@@ -20,6 +20,7 @@ function makeSecretClient() {
         addSecretVersion: jest.fn(),
         disableSecretVersion: jest.fn(),
         createSecret: jest.fn(),
+        deleteSecret: jest.fn(),
     };
 }
 
@@ -198,6 +199,11 @@ describe("storeSecret", () => {
                 expect.stringContaining("Could not compare")
             );
         });
+
+        it("does NOT call logger.info", async () => {
+            await storeSecret("tenant1", "clientId", "some-value");
+            expect(logger.info).not.toHaveBeenCalled();
+        });
     });
 
     // ── Branch 5: getSecret throws with code !== 5 (unexpected error) ────────
@@ -299,5 +305,158 @@ describe("getSecret", () => {
             expect.stringContaining("Failed to retrieve secret"),
             expect.any(String)
         );
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// deleteTenantSecrets
+// ─────────────────────────────────────────────────────────────────────────────
+describe("deleteTenantSecrets", () => {
+    const SECRET_TYPES = ["clientId", "clientSecret", "refreshToken", "webhookVerifier"];
+    let secretClient, logger, deleteTenantSecrets;
+
+    beforeEach(() => {
+        secretClient = makeSecretClient();
+        logger = makeLogger();
+        ({ deleteTenantSecrets } = createSecretManager({ secretClient, PROJECT_ID, logger }));
+    });
+
+    // ── Branch 1: All four secrets exist and are deleted successfully ─────────
+    describe("when all four secrets exist", () => {
+        beforeEach(() => {
+            secretClient.deleteSecret.mockResolvedValue([{}]);
+        });
+
+        it("calls deleteSecret once for each secret type", async () => {
+            await deleteTenantSecrets("tenant1");
+            expect(secretClient.deleteSecret).toHaveBeenCalledTimes(4);
+        });
+
+        it.each(SECRET_TYPES)(
+            "calls deleteSecret with correct name for '%s'",
+            async (secretType) => {
+                await deleteTenantSecrets("tenant1");
+                expect(secretClient.deleteSecret).toHaveBeenCalledWith({
+                    name: `projects/${PROJECT_ID}/secrets/qb-tenant1-${secretType}`,
+                });
+            }
+        );
+
+        it("logs a success message for each deleted secret", async () => {
+            await deleteTenantSecrets("tenant1");
+            expect(logger.info).toHaveBeenCalledTimes(4);
+            SECRET_TYPES.forEach((secretType) => {
+                expect(logger.info).toHaveBeenCalledWith(
+                    expect.stringContaining(`qb-tenant1-${secretType}`)
+                );
+            });
+        });
+
+        it("does NOT call logger.warn or logger.error", async () => {
+            await deleteTenantSecrets("tenant1");
+            expect(logger.warn).not.toHaveBeenCalled();
+            expect(logger.error).not.toHaveBeenCalled();
+        });
+    });
+
+    // ── Branch 2: One secret is NOT_FOUND (code 5) — should be skipped ────────
+    describe("when a secret does not exist (NOT_FOUND / code 5)", () => {
+        beforeEach(() => {
+            const notFoundErr = new Error("not found");
+            notFoundErr.code = 5;
+            // First call resolves (clientId exists), remaining three throw NOT_FOUND
+            secretClient.deleteSecret
+                .mockResolvedValueOnce([{}])
+                .mockRejectedValue(notFoundErr);
+        });
+
+        it("does not throw", async () => {
+            await expect(deleteTenantSecrets("tenant1")).resolves.toBeUndefined();
+        });
+
+        it("logs a warning for each missing secret", async () => {
+            await deleteTenantSecrets("tenant1");
+            // 3 NOT_FOUND secrets → 3 warnings
+            expect(logger.warn).toHaveBeenCalledTimes(3);
+            expect(logger.warn).toHaveBeenCalledWith(
+                expect.stringContaining("not found, skipping")
+            );
+        });
+
+        it("still logs success for the secret that was deleted", async () => {
+            await deleteTenantSecrets("tenant1");
+            expect(logger.info).toHaveBeenCalledTimes(1);
+        });
+
+        it("does NOT call logger.error", async () => {
+            await deleteTenantSecrets("tenant1");
+            expect(logger.error).not.toHaveBeenCalled();
+        });
+    });
+
+    // ── Branch 3: All secrets are NOT_FOUND (code 5) ──────────────────────────
+    describe("when all secrets are NOT_FOUND", () => {
+        beforeEach(() => {
+            const notFoundErr = new Error("not found");
+            notFoundErr.code = 5;
+            secretClient.deleteSecret.mockRejectedValue(notFoundErr);
+        });
+
+        it("does not throw", async () => {
+            await expect(deleteTenantSecrets("tenant1")).resolves.toBeUndefined();
+        });
+
+        it("logs a warning for all four missing secrets", async () => {
+            await deleteTenantSecrets("tenant1");
+            expect(logger.warn).toHaveBeenCalledTimes(4);
+        });
+
+        it("does not call logger.info or logger.error", async () => {
+            await deleteTenantSecrets("tenant1");
+            expect(logger.info).not.toHaveBeenCalled();
+            expect(logger.error).not.toHaveBeenCalled();
+        });
+    });
+
+    // ── Branch 4: deleteSecret throws an unexpected error (code !== 5) ────────
+    describe("when deleteSecret throws an unexpected error", () => {
+        beforeEach(() => {
+            const unexpectedErr = new Error("Permission denied");
+            unexpectedErr.code = 7; // PERMISSION_DENIED
+            secretClient.deleteSecret.mockRejectedValue(unexpectedErr);
+        });
+
+        it("throws a wrapped error containing the secret name and message", async () => {
+            await expect(deleteTenantSecrets("tenant1")).rejects.toThrow(
+                /Failed to delete secret qb-tenant1-.+: Permission denied/
+            );
+        });
+
+        it("logs the error before throwing", async () => {
+            await deleteTenantSecrets("tenant1").catch(() => {});
+            expect(logger.error).toHaveBeenCalledWith(
+                expect.stringContaining("Failed to delete secret"),
+                "Permission denied"
+            );
+        });
+
+        it("does NOT call logger.warn", async () => {
+            await deleteTenantSecrets("tenant1").catch(() => {});
+            expect(logger.warn).not.toHaveBeenCalled();
+        });
+
+        it("does NOT call logger.info", async () => {
+            await deleteTenantSecrets("tenant1").catch(() => {});
+            expect(logger.info).not.toHaveBeenCalled();
+        });
+    });
+
+    // ── Branch 5: Correct secret name format for any tenantId ────────────────
+    it("uses the tenantId correctly in the secret resource name", async () => {
+        secretClient.deleteSecret.mockResolvedValue([{}]);
+        await deleteTenantSecrets("acme-corp");
+        expect(secretClient.deleteSecret).toHaveBeenCalledWith({
+            name: `projects/${PROJECT_ID}/secrets/qb-acme-corp-clientId`,
+        });
     });
 });

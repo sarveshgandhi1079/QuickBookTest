@@ -152,9 +152,9 @@ describe("cleanUndefined", () => {
         expect(cleanUndefined(false)).toBe(false);
     });
 
-    it("filters null and undefined values out of arrays", () => {
+    it("filters undefined values out of arrays but preserves null", () => {
         const result = cleanUndefined([1, null, undefined, 2, "a"]);
-        expect(result).toEqual([1, 2, "a"]);
+        expect(result).toEqual([1, null, 2, "a"]);
     });
 
     it("removes undefined keys from an object", () => {
@@ -162,9 +162,9 @@ describe("cleanUndefined", () => {
         expect(result).toEqual({ a: 1, c: "x" });
     });
 
-    it("removes null values from an object", () => {
+    it("preserves null values in an object (intentional field-clearing)", () => {
         const result = cleanUndefined({ a: 1, b: null });
-        expect(result).toEqual({ a: 1 });
+        expect(result).toEqual({ a: 1, b: null });
     });
 
     it("recursively cleans nested objects", () => {
@@ -172,13 +172,23 @@ describe("cleanUndefined", () => {
         expect(result).toEqual({ a: { c: 2 }, d: 3 });
     });
 
-    it("recursively cleans arrays inside objects", () => {
+    it("recursively cleans arrays inside objects, preserving null", () => {
         const result = cleanUndefined({ arr: [1, null, undefined, 2] });
-        expect(result).toEqual({ arr: [1, 2] });
+        expect(result).toEqual({ arr: [1, null, 2] });
     });
 
     it("returns empty object when all keys are undefined", () => {
         expect(cleanUndefined({ a: undefined })).toEqual({});
+    });
+
+    it("preserves multiple intentional null fields (e.g. Firestore field-clearing)", () => {
+        const result = cleanUndefined({ lastError: null, retryPayload: null, qbId: null, name: "test" });
+        expect(result).toEqual({ lastError: null, retryPayload: null, qbId: null, name: "test" });
+    });
+
+    it("removes undefined but keeps null inside nested objects", () => {
+        const result = cleanUndefined({ a: { x: undefined, y: null, z: 1 } });
+        expect(result).toEqual({ a: { y: null, z: 1 } });
     });
 });
 

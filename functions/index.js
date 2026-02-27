@@ -52,7 +52,7 @@ const secretClient = new SecretManagerServiceClient();
 const PROJECT_ID = process.env.GCP_PROJECT || process.env.GCLOUD_PROJECT;
 const bucket = getStorage().bucket('mbs-app-3ffa0.firebasestorage.app');
 
-const { storeSecret, getSecret } = createSecretManager({ secretClient, PROJECT_ID, logger });
+const { storeSecret, getSecret, deleteTenantSecrets } = createSecretManager({ secretClient, PROJECT_ID, logger });
 const { getTenantConfig, updateTenantRefreshToken } = createTenantConfig({
     qbDb, secretClient, storeSecret, getSecret, utcNowISO, PROJECT_ID, logger,
 });
@@ -359,8 +359,7 @@ async function logFatal(p) {
 // QUICKBOOKS AUTHENTICATION
 // ========================================================================================
 
-async function getAccessToken(tenantId) {
-    const config = await getTenantConfig(tenantId);
+async function getAccessToken(tenantId, config) {
     const authHeader = Buffer.from(`${config.clientId}:${config.clientSecret}`).toString("base64");
 
     try {
@@ -394,7 +393,7 @@ async function withQboClient(tenantId, fn) {
     const config = await getTenantConfig(tenantId);
     if (!config.isActive) throw new Error(`Tenant ${tenantId} is inactive`);
 
-    const accessToken = await getAccessToken(tenantId);
+    const accessToken = await getAccessToken(tenantId, config);
     const baseUrl = `${config.baseUrl.replace(/\/$/, "")}/${config.realmId}`;
 
     return fn({ accessToken, baseUrl, minorVersion: config.minorVersion, tenantId });

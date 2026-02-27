@@ -88,7 +88,38 @@ function createSecretManager({ secretClient, PROJECT_ID, logger }) {
         }
     }
 
-    return { storeSecret, getSecret };
+    /**
+     * Delete all Secret Manager secrets associated with a tenant.
+     * Secret types deleted: clientId, clientSecret, refreshToken, webhookVerifier.
+     * Silently skips secrets that do not exist (NOT_FOUND / code 5).
+     *
+     * @param {string} tenantId
+     */
+    async function deleteTenantSecrets(tenantId) {
+        const secretTypes = ['clientId', 'clientSecret', 'refreshToken', 'webhookVerifier'];
+        const parent = `projects/${PROJECT_ID}`;
+
+        await Promise.all(
+            secretTypes.map(async (secretType) => {
+                const secretId = `qb-${tenantId}-${secretType}`;
+                const secretName = `${parent}/secrets/${secretId}`;
+                try {
+                    await secretClient.deleteSecret({ name: secretName });
+                    logger.info(`✅ Deleted secret: ${secretId}`);
+                } catch (err) {
+                    if (err.code === 5) {
+                        // NOT_FOUND — secret does not exist, skip silently
+                        logger.warn(`⚠️ Secret not found, skipping: ${secretId}`);
+                    } else {
+                        logger.error(`❌ Failed to delete secret ${secretId}:`, err.message);
+                        throw new Error(`Failed to delete secret ${secretId}: ${err.message}`);
+                    }
+                }
+            })
+        );
+    }
+
+    return { storeSecret, getSecret, deleteTenantSecrets };
 }
 
 module.exports = { createSecretManager };

@@ -32,16 +32,18 @@ function pickErrorDetails(err) {
 }
 
 function cleanUndefined(input) {
-    if (input === undefined || input === null) return null;
+    if (input === null) return null;
+    if (input === undefined) return null;
     if (Array.isArray(input)) {
-        return input.map((v) => cleanUndefined(v)).filter((v) => v !== undefined && v !== null);
+        return input
+            .filter((v) => v !== undefined)             // strip undefined only
+            .map((v) => (v === null ? null : cleanUndefined(v))); // preserve null, recurse others
     }
     if (typeof input === "object") {
         const out = {};
         for (const [k, v] of Object.entries(input)) {
-            if (v === undefined) continue;
-            const cleaned = cleanUndefined(v);
-            if (cleaned !== undefined && cleaned !== null) out[k] = cleaned;
+            if (v === undefined) continue;              // skip undefined keys only
+            out[k] = v === null ? null : cleanUndefined(v); // preserve null values
         }
         return out;
     }

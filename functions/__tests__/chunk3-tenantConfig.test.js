@@ -328,6 +328,13 @@ describe("updateTenantRefreshToken", () => {
                 updateTenantRefreshToken("tenant1", "brand-new-token")
             ).resolves.toBeUndefined();
         });
+
+        it("logs a 'rotated successfully' message", async () => {
+            await updateTenantRefreshToken("tenant1", "brand-new-token");
+            expect(logger.info).toHaveBeenCalledWith(
+                expect.stringContaining("Refresh token rotated successfully")
+            );
+        });
     });
 
     // ── Branch 4: accessSecretVersion throws a non-5 error ──────────────────
