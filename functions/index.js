@@ -1800,11 +1800,29 @@ async function retryEntityOperation(tenantId, entityName, docRef, data) {
         }
     }
     else if (localStatus === LOCAL_STATUS.ERROR_DELETE && retryPayload) {
-        // Retry DELETE operation
-        const { Id, SyncToken } = retryPayload;
+        // Retry DELETE operation — always fetch fresh SyncToken from QBO first,
+        // since the stored retryPayload.SyncToken may be stale if QBO was updated
+        // after the original failure (stale SyncToken → conflict error → infinite retry loop).
+        const { Id } = retryPayload;
 
         await withQboClient(tenantId, async (client) => {
-            await qboDelete(entityName, Id, SyncToken, client);
+            let freshSyncToken;
+            try {
+                const getRes = await qboGet(cfg.getPath(Id, client.minorVersion), client);
+                const freshEntity = getRes.data?.[entityName];
+                if (!freshEntity) throw new Error(`${entityName} ${Id} not found in QBO response`);
+                freshSyncToken = freshEntity.SyncToken;
+            } catch (getErr) {
+                // If QBO returns 404 / entity already deleted, treat as success
+                const status = getErr?.response?.status;
+                if (status === 404) {
+                    logger.info(`⚠️ [RETRY] ${entityName} ${Id} already deleted in QBO — marking as SYNCED`);
+                    return; // skip the delete call, fall through to Firestore update
+                }
+                throw getErr;
+            }
+
+            await qboDelete(entityName, Id, freshSyncToken, client);
         });
 
         await docRef.set(
@@ -4275,6 +4293,7 @@ function makeDeleteHandler(entityName) {
             let tenantId = null;
             let docId = null;
             let qbId = null;
+            let syncToken = null;
             let logDocId = null;
             let fsAfterPending = null;
             let attachmentResults = null;
@@ -4623,7 +4642,7 @@ function makeDeleteHandler(entityName) {
                             cleanUndefined({
                                 localStatus: LOCAL_STATUS.ERROR_DELETE,
                                 lastError: e,
-                                retryPayload: qbId ? { Id: qbId } : null,
+                                retryPayload: qbId ? { Id: qbId, SyncToken: syncToken || null } : null,
                                 updatedAt: utcNowISO(),
                             }),
                             { merge: true }
