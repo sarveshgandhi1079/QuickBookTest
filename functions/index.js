@@ -548,7 +548,9 @@ async function saveListToFirestoreWithIds(tenantId, collectionName, items, entit
 
     const writer = qbDb.bulkWriter();
     writer.onWriteError((err) => {
-        const code = err?.code || err?.status;
+        // err.code is the gRPC status code (number). err.status is not a standard
+        // BulkWriter WriteError property and is always undefined — do not fall back to it.
+        const code = err.code;
         if (err.failedAttempts < 5 && (code === 4 || code === 10 || code === 14)) return true;
         logger.error("BulkWriter write failed:", err);
         return false;
@@ -2986,6 +2988,42 @@ exports.quickBooksWebhook = onRequest(
                         });
                         continue;
                     }
+
+                    // ========== LAYER 1: SYNCTOKEN DEDUPLICATION ==========
+                    // QBO increments SyncToken on every mutation.
+                    // If the token matches what we already have in Firestore,
+                    // this is a duplicate delivery — skip the write entirely.
+                    if (existingRef) {
+                        try {
+                            const existingSnap = await existingRef.get();
+                            if (existingSnap.exists) {
+                                const existingData = existingSnap.data();
+                                if (
+                                    existingData?.SyncToken &&
+                                    entityObj.SyncToken &&
+                                    existingData.SyncToken === entityObj.SyncToken
+                                ) {
+                                    logger.info(
+                                        `⏭️ [${tenantId}] Skipping duplicate webhook for ${name} ${qbId} — SyncToken unchanged (${entityObj.SyncToken})`
+                                    );
+                                    await logEnd({
+                                        tenantId,
+                                        entityName: name,
+                                        collectionName: cfg.collection,
+                                        docId: logDocId,
+                                        qbId,
+                                        op: OPERATIONS.WEBHOOK,
+                                        msg: `Duplicate webhook skipped — SyncToken unchanged (${entityObj.SyncToken})`,
+                                    });
+                                    continue;
+                                }
+                            }
+                        } catch (dedupErr) {
+                            // Non-fatal: if we can't read the existing doc, proceed and let the upsert handle it
+                            logger.warn(`⚠️ [${tenantId}] SyncToken dedup check failed for ${name} ${qbId}, proceeding:`, dedupErr.message);
+                        }
+                    }
+                    // =====================================================
 
                     try {
                         const safeEntityObj = cleanUndefined(entityObj);
