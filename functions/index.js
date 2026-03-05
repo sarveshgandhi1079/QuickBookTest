@@ -25,6 +25,8 @@ const {
 } = require('./utils');
 const { createSecretManager } = require('./secretManager');
 const { createTenantConfig } = require('./tenantConfig');
+const { createLogging } = require('./logging');
+const { createFirestoreHelpers } = require('./firestore');
 
 initializeApp();
 
@@ -113,6 +115,23 @@ const ENTITY_CONFIG = {
     Attachable: { collection: "attachables", getPath: (id, mv) => `/attachable/${id}?minorversion=${mv}` },
 };
 
+const {
+    getEntityLogDocRef,
+    appendLogStep,
+    buildTenantErrorDocId,
+    upsertTenantErrorIndex,
+    logStart,
+    logEnd,
+    logFsOk,
+    logQboRequest,
+    logQboOk,
+    logFsFail,
+    logQboFail,
+    logFatal,
+} = createLogging({ qbDb, FieldValue, utcNowISO, cleanUndefined, trimObject, safeIdPart, logger, LOG_STAGES });
+
+const { getTotalCountSafe, readDocSafe } = createFirestoreHelpers({ logger });
+
 const STORAGE_CONFIG = {
     BUCKET_NAME: 'mbs-app-3ffa0.firebasestorage.app',
     BASE_PATH: 'cdpTest',
@@ -133,28 +152,7 @@ const STORAGE_CONFIG = {
 // safeIdPart, parseBool, parseIntSafe, parseISODate, tryParseJSON
 // — all imported at the top of this file from './utils'
 
-async function getTotalCountSafe(query) {
-    try {
-        if (typeof query.count === "function") {
-            const agg = await query.count().get();
-            const data = agg.data();
-            const c = data?.count;
-            return typeof c === "number" ? c : null;
-        }
-    } catch (e) {
-        logger.warn("Count aggregation failed (falling back to null):", e?.message || e);
-    }
-    return null;
-}
-
-async function readDocSafe(ref) {
-    try {
-        const snap = await ref.get();
-        return snap.exists ? { docId: snap.id, ...snap.data() } : null;
-    } catch {
-        return null;
-    }
-}
+// getTotalCountSafe, readDocSafe — wired above via createFirestoreHelpers()
 
 // ========================================================================================
 // SECRET MANAGER OPERATIONS (imported from secretManager.js)
@@ -167,193 +165,11 @@ async function readDocSafe(ref) {
 // getTenantConfig, updateTenantRefreshToken — wired above via createTenantConfig()
 
 // ========================================================================================
-// LOGGING SYSTEM (PER-ENTITY + ERROR INDEX)
+// LOGGING SYSTEM (imported from logging.js)
 // ========================================================================================
-
-function getEntityLogDocRef({ tenantId, entityName, docId }) {
-    return qbDb
-        .collection("tenants")
-        .doc(tenantId)
-        .collection("logs")
-        .doc(docId);
-}
-
-async function appendLogStep({
-    tenantId,
-    entityName,
-    collectionName,
-    docId,
-    qbId = null,
-    op,
-    stage,
-    msg,
-    req = null,
-    res = null,
-    err = null,
-    maxSteps = 50,
-}) {
-    if (!tenantId || !entityName || !docId) return;
-
-    const now = utcNowISO();
-    const ref = getEntityLogDocRef({ tenantId, entityName, docId });
-
-    const step = cleanUndefined({
-        ts: now,
-        op,
-        stage,
-        msg,
-        req: trimObject(req),
-        res: trimObject(res),
-        err: err ? trimObject(err) : null,
-    });
-
-    await qbDb.runTransaction(async (tx) => {
-        const snap = await tx.get(ref);
-        const prev = snap.exists ? snap.data() : {};
-        const steps = Array.isArray(prev.steps) ? prev.steps : [];
-
-        steps.push(step);
-        const trimmedSteps = steps.slice(Math.max(0, steps.length - maxSteps));
-
-        tx.set(
-            ref,
-            cleanUndefined({
-                tenantId,
-                entityName,
-                collectionName,
-                docId,
-                qbId: qbId ?? prev.qbId ?? null,
-                createdAt: prev.createdAt || now,
-                updatedAt: now,
-                lastOp: op,
-                lastStage: stage,
-                lastMessage: msg,
-                lastError: err || null,
-                steps: trimmedSteps,
-            }),
-            { merge: true }
-        );
-    });
-}
-
-function buildTenantErrorDocId({ entityName, op, stage, recordDocId, qbId, logDocId }) {
-    const e = safeIdPart(entityName, 40);
-    const o = safeIdPart(op, 20);
-    const st = safeIdPart(stage, 20);
-
-    if (recordDocId) return `${e}__${o}__${st}__doc_${safeIdPart(recordDocId, 80)}`;
-    if (qbId) return `${e}__${o}__${st}__qb_${safeIdPart(qbId, 80)}`;
-    if (logDocId) return `${e}__${o}__${st}__log_${safeIdPart(logDocId, 80)}`;
-    return `${e}__${o}__${st}__unknown`;
-}
-
-async function upsertTenantErrorIndex({
-    tenantId,
-    entityName,
-    collectionName = null,
-    op,
-    stage,
-    message,
-    recordDocId = null,
-    qbId = null,
-    logDocId = null,
-    request = null,
-    response = null,
-    error = null,
-}) {
-    if (!tenantId || !entityName || !op || !stage) return;
-
-    const now = utcNowISO();
-    const errorDocId = buildTenantErrorDocId({ entityName, op, stage, recordDocId, qbId, logDocId });
-    const ref = qbDb.collection("tenants").doc(tenantId).collection("error_index").doc(errorDocId);
-
-    const patch = cleanUndefined({
-        errorDocId,
-        tenantId,
-        entityName,
-        collectionName,
-        op,
-        stage,
-        message: message || null,
-        recordDocId: recordDocId || null,
-        qbId: qbId || null,
-        logDocId: logDocId || null,
-        lastError: error ? trimObject(error) : null,
-        lastRequest: request ? trimObject(request) : null,
-        lastResponse: response ? trimObject(response) : null,
-        lastSeenAt: now,
-        updatedAt: now,
-    });
-
-    await qbDb.runTransaction(async (tx) => {
-        const snap = await tx.get(ref);
-        if (!snap.exists) {
-            tx.set(ref, cleanUndefined({ ...patch, count: 1, firstSeenAt: now, createdAt: now }), { merge: true });
-        } else {
-            tx.set(ref, cleanUndefined({ ...patch, count: FieldValue.increment(1) }), { merge: true });
-        }
-    });
-}
-
-async function logStart(p) { return appendLogStep({ ...p, stage: LOG_STAGES.START }); }
-async function logEnd(p) { return appendLogStep({ ...p, stage: LOG_STAGES.END }); }
-async function logFsOk(p) { return appendLogStep({ ...p, stage: LOG_STAGES.FS_OK }); }
-async function logQboRequest(p) { return appendLogStep({ ...p, stage: LOG_STAGES.QBO_REQUEST }); }
-async function logQboOk(p) { return appendLogStep({ ...p, stage: LOG_STAGES.QBO_OK }); }
-
-async function logFsFail(p) {
-    await appendLogStep({ ...p, stage: LOG_STAGES.FS_FAIL });
-    await upsertTenantErrorIndex({
-        tenantId: p.tenantId,
-        entityName: p.entityName,
-        collectionName: p.collectionName,
-        op: p.op,
-        stage: "FS_FAIL",
-        message: p.msg,
-        recordDocId: p.recordDocId,
-        qbId: p.qbId,
-        logDocId: p.docId,
-        request: p.req,
-        response: p.res,
-        error: p.err,
-    }).catch(e => logger.error("Failed to upsert error_index (FS_FAIL):", e?.message));
-}
-
-async function logQboFail(p) {
-    await appendLogStep({ ...p, stage: LOG_STAGES.QBO_FAIL });
-    await upsertTenantErrorIndex({
-        tenantId: p.tenantId,
-        entityName: p.entityName,
-        collectionName: p.collectionName,
-        op: p.op,
-        stage: "QBO_FAIL",
-        message: p.msg,
-        recordDocId: p.recordDocId,
-        qbId: p.qbId,
-        logDocId: p.docId,
-        request: p.req,
-        response: p.res,
-        error: p.err,
-    }).catch(e => logger.error("Failed to upsert error_index (QBO_FAIL):", e?.message));
-}
-
-async function logFatal(p) {
-    await appendLogStep({ ...p, stage: LOG_STAGES.FATAL });
-    await upsertTenantErrorIndex({
-        tenantId: p.tenantId,
-        entityName: p.entityName,
-        collectionName: p.collectionName,
-        op: p.op,
-        stage: "FATAL",
-        message: p.msg,
-        recordDocId: p.recordDocId,
-        qbId: p.qbId,
-        logDocId: p.docId,
-        request: p.req,
-        response: p.res,
-        error: p.err,
-    }).catch(e => logger.error("Failed to upsert error_index (FATAL):", e?.message));
-}
+// getEntityLogDocRef, appendLogStep, buildTenantErrorDocId, upsertTenantErrorIndex,
+// logStart, logEnd, logFsOk, logQboRequest, logQboOk, logFsFail, logQboFail, logFatal
+// — all wired above via createLogging()
 
 // ========================================================================================
 // QUICKBOOKS AUTHENTICATION

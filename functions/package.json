@@ -16,7 +16,9 @@
     "collectCoverageFrom": [
       "utils.js",
       "secretManager.js",
-      "tenantConfig.js"
+      "tenantConfig.js",
+      "logging.js",
+      "firestore.js"
     ],
     "coverageThreshold": {
       "global": {
